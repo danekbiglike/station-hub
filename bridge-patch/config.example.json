@@ -1,0 +1,9 @@
+{
+  "listen": "127.0.0.1:18443",
+  "upstream": "wss://uniproxy.alice.yandex.net/uni.ws",
+  "mode": "hybrid",
+  "llm_base_url": "https://example.invalid/v1",
+  "llm_model": "unused",
+  "listen_after_reply": false,
+  "conversation_log": { "enabled": false }
+}

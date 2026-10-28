@@ -1,0 +1,26 @@
+name: Ошибка
+description: Сообщить о воспроизводимой проблеме без личных данных
+body:
+  - type: markdown
+    attributes:
+      value: Не прикладывайте ключи, токены, реальные IP, дампы и записи разговоров. Для проблем безопасности используйте SECURITY.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло и что ожидалось
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как воспроизвести
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Модель, версия прошивки и версия Windows
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Дополнительная информация без личных данных

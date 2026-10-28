@@ -1,0 +1,195 @@
+diff --git a/cmd/quasar-bridge/main.go b/cmd/quasar-bridge/main.go
+index 8bdb23e..f089da1 100644
+--- a/cmd/quasar-bridge/main.go
++++ b/cmd/quasar-bridge/main.go
+@@ -29,6 +29,11 @@ import (
+ )
+ 
+ func main() {
++	if dns := os.Getenv("STATION_HUB_DNS"); net.ParseIP(dns) != nil {
++		net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
++			return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, network, net.JoinHostPort(dns, "53"))
++		}}
++	}
+ 	path := flag.String("config", "config.json", "configuration file")
+ 	query := flag.String("query", "", "run one text query for backend diagnostics")
+ 	check := flag.Bool("check-backends", false, "check LLM and configured Home Assistant connectivity")
+@@ -246,7 +251,11 @@ func main() {
+ 		}
+ 
+ 		proxy.NewSession = func(ctx context.Context, up, down bridge.Sender) bridge.Session {
+-			n := bridge.NewNative(ctx, up, down, engine)
++			var resolver bridge.Resolver = engine
++			if key := os.Getenv("STATION_HUB_KEY"); len(key) == 16 {
++				resolver = &bridge.StationHubResolver{Hub: bridge.LocalHub{Address: "127.0.0.1:27362", Key: key}}
++			}
++			n := bridge.NewNative(ctx, up, down, resolver)
+ 			n.GateText = false
+ 			n.ShouldListen = cfg.ListenAfterReply
+ 			if cfg.LocalProgress.Enabled {
+@@ -272,7 +281,7 @@ func main() {
+ 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("Content-Type", "application/json")
+ 		state := engine.RoutingStatus()
+-		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil})
++		data, _ := json.Marshal(map[string]any{"status": "ok", "mode": cfg.Mode, "active_connections": proxy.ActiveConnections.Load(), "client_frames": clientCount.Load(), "server_frames": serverCount.Load(), "routing_revision": state.Revision, "routing_rules": state.ActiveRules, "conversation_log_enabled": logs.Enabled(), "conversation_log_failures": logs.Failures(), "assistant_tools_enabled": cfg.AssistantTools.Enabled, "dialogue_context_enabled": cfg.DialogueContext.Enabled && cfg.Mode == "hybrid", "home_assistant_enabled": hc != nil && cfg.Mode == "hybrid", "mcp_servers_configured": mcpConfigured, "music_playback_enabled": musicQueue != nil})
+ 		_, _ = w.Write(data)
+ 	})
+ 	mux.Handle("/uni.ws", proxy)
+diff --git a/internal/bridge/native.go b/internal/bridge/native.go
+index 4fe9934..fecd771 100644
+--- a/internal/bridge/native.go
++++ b/internal/bridge/native.go
+@@ -31,6 +31,7 @@ import (
+ type Resolution struct {
+ 	Route  string
+ 	Answer string
++	Listen *bool
+ }
+ type Resolver interface {
+ 	Resolve(context.Context, string) (Resolution, error)
+@@ -44,6 +45,7 @@ type FallbackResolver interface {
+ }
+ 
+ type nativeRequest struct {
++	listenOverride                  *bool
+ 	streaming                       bool
+ 	listenOnStreamStart             bool
+ 	partial                         uint32
+@@ -573,6 +575,7 @@ func (n *Native) maybeResolve(p *nativeRequest) {
+ 			n.OnRoute(p.id, result.Route)
+ 		}
+ 		p.route = result.Route
++		p.listenOverride = result.Listen
+ 		if result.Route == "yandex" {
+ 			p.cloud = true
+ 			var err error
+@@ -629,7 +632,11 @@ func (n *Native) reply(p *nativeRequest, text string) error {
+ 	}
+ 	answer := &response.TAliceResponseProto{Header: &response.TAliceResponseProto_THeader{RequestId: new(requestID), ResponseId: new(newID()), DialogId: new(p.request.GetHeader().GetDialogId()), SequenceNumber: new(p.request.GetHeader().GetSequenceNumber())}, VoiceResponse: &response.TAliceResponseProto_TVoiceResponse{OutputSpeech: &response.TAliceResponseProto_TVoiceResponse_TOutputSpeech{Text: new(text)}, HasVoiceResponse: true}, Response: &response.TAliceResponseProto_TResponse{Cards: []*response.TAliceResponseProto_TResponse_TCard{{Type: "simple_text", Text: new(text), CardId: new(newID())}}}}
+ 	silentPlayback := n.hasSilentPlayback(p)
+-	answer.VoiceResponse.ShouldListen = n.ShouldListen && !silentPlayback
++	listen := n.ShouldListen
++	if p.listenOverride != nil {
++		listen = *p.listenOverride
++	}
++	answer.VoiceResponse.ShouldListen = listen && !silentPlayback
+ 	if silentPlayback {
+ 		answer.VoiceResponse.HasVoiceResponse = false
+ 		answer.VoiceResponse.OutputSpeech.Text = new("")
+diff --git a/internal/bridge/native_test.go b/internal/bridge/native_test.go
+index 84fc526..473c44b 100644
+--- a/internal/bridge/native_test.go
++++ b/internal/bridge/native_test.go
+@@ -545,3 +545,27 @@ func TestExistingNativeSessionUsesReloadedRoute(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestStationHubListenOverride(t *testing.T) {
++	for _, want := range []bool{true, false} {
++		n, _, down := soundSession(t, resolverFunc(func(context.Context, string) (Resolution, error) {
++			return Resolution{Route: "stationhub", Answer: "Готово", Listen: &want}, nil
++		}))
++		n.ShouldListen = !want
++		input := wire.Decode(soundInput("hub-follow-up"), wire.ClientToServer).Client
++		e := input.GetEvent()
++		e.Event = &client.TClientMessage_TEvent_VoiceInput{VoiceInput: e.GetTextInput()}
++		if err := n.Client(t.Context(), websocket.MessageBinary, aa(input)); err != nil {
++			t.Fatal(err)
++		}
++		for {
++			f := nextSoundFrame(t, down)
++			if response := f.Server.GetEvent().GetAliceResponse(); response != nil {
++				if got := response.GetVoiceResponse().GetShouldListen(); got != want {
++					t.Fatalf("listen=%v want %v", got, want)
++				}
++				break
++			}
++		}
++	}
++}
+diff --git a/internal/bridge/proxy.go b/internal/bridge/proxy.go
+index 5e33280..8f4207b 100644
+--- a/internal/bridge/proxy.go
++++ b/internal/bridge/proxy.go
+@@ -7,16 +7,18 @@ import (
+ 	"quasarbridge/internal/journal"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/coder/websocket"
+ )
+ 
+ type Proxy struct {
+-	Journal    *journal.Writer
+-	Upstream   string
+-	Observer   func(direction string, kind websocket.MessageType, data []byte)
+-	NewSession func(context.Context, Sender, Sender) Session
++	ActiveConnections atomic.Int64
++	Journal           *journal.Writer
++	Upstream          string
++	Observer          func(direction string, kind websocket.MessageType, data []byte)
++	NewSession        func(context.Context, Sender, Sender) Session
+ }
+ 
+ type Sender func(context.Context, websocket.MessageType, []byte) error
+@@ -65,6 +67,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	defer down.CloseNow()
++	p.ActiveConnections.Add(1)
++	defer p.ActiveConnections.Add(-1)
+ 	down.SetReadLimit(8 << 20)
+ 	up.SetReadLimit(8 << 20)
+ 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+diff --git a/internal/bridge/proxy_test.go b/internal/bridge/proxy_test.go
+index b1949f6..7925912 100644
+--- a/internal/bridge/proxy_test.go
++++ b/internal/bridge/proxy_test.go
+@@ -68,3 +68,43 @@ func TestProxyRejectsUnavailableUpstreamBeforeUpgrade(t *testing.T) {
+ 		t.Fatalf("status=%d, want 502", w.Code)
+ 	}
+ }
++
++func TestProxyTracksLiveConnections(t *testing.T) {
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		c, e := websocket.Accept(w, r, nil)
++		if e != nil {
++			return
++		}
++		defer c.CloseNow()
++		for {
++			if _, _, e = c.Read(r.Context()); e != nil {
++				return
++			}
++		}
++	}))
++	defer upstream.Close()
++	p := &Proxy{Upstream: "ws" + strings.TrimPrefix(upstream.URL, "http") + "/uni.ws"}
++	srv := httptest.NewServer(p)
++	defer srv.Close()
++	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++	defer cancel()
++	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/uni.ws", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	until := time.Now().Add(time.Second)
++	for p.ActiveConnections.Load() != 1 && time.Now().Before(until) {
++		time.Sleep(5 * time.Millisecond)
++	}
++	if got := p.ActiveConnections.Load(); got != 1 {
++		t.Fatalf("active after connect: %d", got)
++	}
++	c.CloseNow()
++	until = time.Now().Add(time.Second)
++	for p.ActiveConnections.Load() != 0 && time.Now().Before(until) {
++		time.Sleep(5 * time.Millisecond)
++	}
++	if got := p.ActiveConnections.Load(); got != 0 {
++		t.Fatalf("active after disconnect: %d", got)
++	}
++}

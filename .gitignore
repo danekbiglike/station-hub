@@ -1,0 +1,23 @@
+# Local build artifacts and device/user data must never be published.
+/build/
+/windows/native/build/
+__pycache__/
+*.py[cod]
+*.obj
+*.exe
+*.apk
+*.idsig
+*.log
+*.pid
+*.keystore
+*.jks
+*.pem
+*.key
+*.p12
+*.pfx
+*.env
+.env*
+runtime/
+config.local.*
+.vscode/
+.idea/
